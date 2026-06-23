@@ -1,0 +1,165 @@
+# GitHub Actions — two-path deploy for branch {@ ENV_NAME @} → workspace {@ WORKSPACE_NAME @}
+#
+# Path 1 — pulumi/** changed   → pulumi preview (PR) or pulumi up (push)
+# Path 2 — app files changed,  → ASG instance refresh (new instances pull latest code on boot)
+#           pulumi NOT changed
+#
+# Required repository secrets (CI only):
+#   AWS_ACCESS_KEY_ID      — AWS credentials for Pulumi + SSM
+#   AWS_SECRET_ACCESS_KEY  — AWS credentials for Pulumi + SSM
+#   PULUMI_S3_STATE        — S3 backend URL, e.g. s3://my-pulumi-state-bucket
+#
+# All application secrets live in AWS Secrets Manager: {@ SECRET_NAME @}
+# Pulumi reads that secret at deploy time; the EC2 instance pulls it on first boot.
+
+name: Deploy — {@ ENV_NAME @}
+
+on:
+  push:
+    branches: ["{@ ENV_NAME @}"]
+  pull_request:
+    branches: ["{@ ENV_NAME @}"]
+
+env:
+  AWS_REGION: {@ AWS_REGION @}
+  WORKSPACE: {@ WORKSPACE_NAME @}
+  SM_SECRET: {@ SECRET_NAME @}
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      infra: ${{ steps.filter.outputs.infra }}
+      app: ${{ steps.filter.outputs.app }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            infra:
+              - 'pulumi/**'
+            app:
+              - '**'
+              - '!pulumi/**'
+
+  # ── PR: preview infra changes ──────────────────────────────────────────────
+  pulumi-preview:
+    needs: detect-changes
+    if: github.event_name == 'pull_request' && needs.detect-changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install -r requirements.txt
+        working-directory: pulumi
+      - uses: pulumi/actions@v5
+        with:
+          command: preview
+          stack-name: ${{ env.WORKSPACE }}
+          work-dir: pulumi
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
+          AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          AWS_DEFAULT_REGION: {@ AWS_REGION @}
+
+  # ── Push: apply infra changes ──────────────────────────────────────────────
+  pulumi-apply:
+    needs: detect-changes
+    if: github.event_name == 'push' && needs.detect-changes.outputs.infra == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: {@ AWS_REGION @}
+      - run: pip install -r requirements.txt
+        working-directory: pulumi
+      - name: Install Pulumi CLI
+        run: curl -fsSL https://get.pulumi.com | sh && echo "$HOME/.pulumi/bin" >> $GITHUB_PATH
+      - name: Pulumi login
+        run: pulumi login $PULUMI_BACKEND_URL
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
+          PULUMI_CONFIG_PASSPHRASE: ""
+      - name: Bump startup_code_version and deploy
+        run: |
+          cd pulumi
+          pulumi stack select ${{ env.WORKSPACE }} 2>/dev/null || pulumi stack init ${{ env.WORKSPACE }}
+          pulumi config set startup_code_version "${{ github.sha }}" --stack ${{ env.WORKSPACE }}
+          pulumi up --yes --stack ${{ env.WORKSPACE }}
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
+          PULUMI_CONFIG_PASSPHRASE: ""
+      - name: Start and wait for ASG instance refresh
+        run: |
+          ASG_NAME=$(cd pulumi && pulumi stack output asg_name --stack ${{ env.WORKSPACE }})
+          echo "Starting instance refresh for ASG: $ASG_NAME"
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences '{"MinHealthyPercentage":0,"InstanceWarmup":300}' 2>&1 || true
+          echo "Waiting for instance refresh..."
+          for i in $(seq 1 40); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "Pending")
+            echo "  [$i/40] $STATUS"
+            case "$STATUS" in
+              Successful) echo "Instance refresh completed."; break ;;
+              Failed|Cancelled) echo "Instance refresh $STATUS"; exit 1 ;;
+            esac
+            [ "$i" -eq 40 ] && { echo "Timeout waiting for instance refresh"; exit 1; }
+            sleep 30
+          done
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
+          PULUMI_CONFIG_PASSPHRASE: ""
+
+  # ── Push: redeploy app via ASG instance refresh ────────────────────────────
+  deploy-app:
+    needs: detect-changes
+    if: >
+      github.event_name == 'push' &&
+      needs.detect-changes.outputs.app == 'true' &&
+      needs.detect-changes.outputs.infra != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: {@ AWS_REGION @}
+      - name: Start and wait for ASG instance refresh
+        run: |
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --filters \
+              "Name=tag:Environment,Values={@ WORKSPACE_NAME @}" \
+              "Name=tag:ManagedBy,Values=Pulumi" \
+            --query "AutoScalingGroups[0].AutoScalingGroupName" --output text)
+          echo "Starting instance refresh for ASG: $ASG_NAME"
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences '{"MinHealthyPercentage":0,"InstanceWarmup":300}' 2>&1 || true
+          echo "Waiting for instance refresh..."
+          for i in $(seq 1 40); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "Pending")
+            echo "  [$i/40] $STATUS"
+            case "$STATUS" in
+              Successful) echo "Instance refresh completed."; break ;;
+              Failed|Cancelled) echo "Instance refresh $STATUS"; exit 1 ;;
+            esac
+            [ "$i" -eq 40 ] && { echo "Timeout waiting for instance refresh"; exit 1; }
+            sleep 30
+          done

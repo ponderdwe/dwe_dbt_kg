@@ -1,0 +1,10 @@
+name: {{ project_name }}
+description: DWE dbt Knowledge Graph Infrastructure for {{ project_name }} (EC2 + ALB + Route53)
+runtime:
+  name: python
+  options:
+    virtualenv: venv
+config:
+  pulumi:tags:
+    value:
+      pulumi:template: dwe-dbt-kg

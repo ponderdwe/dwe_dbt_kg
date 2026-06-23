@@ -1,0 +1,52 @@
+# DWE dbt Knowledge Graph — Full Stack Docker Compose
+# Services: FalkorDB graph DB + FastAPI + Streamlit chat UI
+#
+# Usage:
+#   cp .env.example .env  # fill in values
+#   docker compose up -d
+
+version: "3.9"
+
+networks:
+  dbt_kg_network:
+    driver: bridge
+
+volumes:
+  falkordb_data:
+
+services:
+
+  # ── FalkorDB — graph database ──────────────────────────────────
+  falkordb:
+    image: falkordb/falkordb:latest
+    restart: always
+    volumes:
+      - falkordb_data:/var/lib/falkordb/data
+    networks:
+      - dbt_kg_network
+
+  # ── FastAPI — dbt-kg backend ───────────────────────────────────
+  fastapi:
+    image: pondered/dbt-kg-api:latest
+    restart: always
+    env_file: .env
+    environment:
+      - GRAPH_DB=falkordb
+      - GRAPH_HOST=falkordb
+      - GRAPH_PORT=6379
+    depends_on:
+      - falkordb
+    networks:
+      - dbt_kg_network
+
+  # ── Streamlit — chat UI ────────────────────────────────────────
+  dbt-kg-chat:
+    image: pondered/dbt-kg-chat:latest
+    restart: always
+    env_file: .env
+    ports:
+      - "8501:8501"
+    depends_on:
+      - fastapi
+    networks:
+      - dbt_kg_network
