@@ -1,8 +1,8 @@
 # GitHub Actions — two-path deploy for branch {@ ENV_NAME @} → workspace {@ WORKSPACE_NAME @}
 #
-# Path 1 — pulumi/** changed   → pulumi preview (PR) or pulumi up (push)
-# Path 2 — app files changed,  → ASG instance refresh (new instances pull latest code on boot)
-#           pulumi NOT changed
+# Path 1 — pulumi/** changed        → pulumi up + full ASG instance refresh
+# Path 2 — .env.example changed     → full ASG instance refresh (re-reads Secrets Manager)
+# Path 3 — other app files changed  → SSM: git pull + docker-compose up on running instance
 #
 # Required repository secrets (CI only):
 #   AWS_ACCESS_KEY_ID      — AWS credentials for Pulumi + SSM
@@ -31,6 +31,7 @@ jobs:
     outputs:
       infra: ${{ steps.filter.outputs.infra }}
       app: ${{ steps.filter.outputs.app }}
+      env_file: ${{ steps.filter.outputs.env_file }}
     steps:
       - uses: actions/checkout@v4
       - uses: dorny/paths-filter@v3
@@ -39,6 +40,8 @@ jobs:
           filters: |
             infra:
               - 'pulumi/**'
+            env_file:
+              - '.env.example'
             app:
               - '**'
               - '!pulumi/**'
@@ -66,7 +69,7 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           AWS_DEFAULT_REGION: {@ AWS_REGION @}
 
-  # ── Push: apply infra changes ──────────────────────────────────────────────
+  # ── Push: apply infra changes → full instance refresh ─────────────────────
   pulumi-apply:
     needs: detect-changes
     if: github.event_name == 'push' && needs.detect-changes.outputs.infra == 'true'
@@ -99,42 +102,79 @@ jobs:
         env:
           PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
           PULUMI_CONFIG_PASSPHRASE: ""
-      - name: Restart docker-compose on running EC2 via SSM
+      - name: Full instance refresh
         run: |
           ASG_NAME=$(cd pulumi && pulumi stack output asg_name --stack ${{ env.WORKSPACE }})
-          INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
-            --auto-scaling-group-names "$ASG_NAME" \
-            --query "AutoScalingGroups[0].Instances[0].InstanceId" --output text)
-          echo "Restarting docker-compose on $INSTANCE_ID via SSM..."
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters '{"commands":["cd /home/ubuntu/dbt-kg && git pull && docker compose pull && docker compose up -d"]}' \
-            --query "Command.CommandId" --output text)
-          echo "SSM command: $COMMAND_ID — waiting..."
-          for i in $(seq 1 40); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null || echo "Pending")
-            echo "  [$i/40] $STATUS"
+          echo "Starting instance refresh for ASG: $ASG_NAME"
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences '{"MinHealthyPercentage":0,"InstanceWarmup":300}' 2>&1 || true
+          echo "Waiting for instance refresh to complete..."
+          for i in $(seq 1 60); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "Pending")
+            echo "  [$i/60] $STATUS"
             case "$STATUS" in
-              Success) echo "Restart completed."; break ;;
-              Failed|Cancelled|TimedOut) echo "SSM command $STATUS"; exit 1 ;;
+              Successful) echo "Instance refresh completed."; break ;;
+              Failed|Cancelled) echo "Instance refresh $STATUS"; exit 1 ;;
             esac
-            [ "$i" -eq 40 ] && { echo "Timeout waiting for SSM command"; exit 1; }
-            sleep 15
+            [ "$i" -eq 60 ] && { echo "Timeout waiting for instance refresh"; exit 1; }
+            sleep 30
           done
         env:
           PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
           PULUMI_CONFIG_PASSPHRASE: ""
 
-  # ── Push: redeploy app via SSM docker-compose restart ─────────────────────
+  # ── Push: .env.example changed → full instance refresh ────────────────────
+  deploy-app-full:
+    needs: detect-changes
+    if: >
+      github.event_name == 'push' &&
+      needs.detect-changes.outputs.env_file == 'true' &&
+      needs.detect-changes.outputs.infra != 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: {@ AWS_REGION @}
+      - name: Full instance refresh (re-reads Secrets Manager on boot)
+        run: |
+          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
+            --filters \
+              "Name=tag:Environment,Values={@ WORKSPACE_NAME @}" \
+              "Name=tag:ManagedBy,Values=Pulumi" \
+            --query "AutoScalingGroups[0].AutoScalingGroupName" --output text)
+          echo "Starting instance refresh for ASG: $ASG_NAME"
+          aws autoscaling start-instance-refresh \
+            --auto-scaling-group-name "$ASG_NAME" \
+            --strategy Rolling \
+            --preferences '{"MinHealthyPercentage":0,"InstanceWarmup":300}' 2>&1 || true
+          echo "Waiting for instance refresh to complete..."
+          for i in $(seq 1 60); do
+            STATUS=$(aws autoscaling describe-instance-refreshes \
+              --auto-scaling-group-name "$ASG_NAME" \
+              --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "Pending")
+            echo "  [$i/60] $STATUS"
+            case "$STATUS" in
+              Successful) echo "Instance refresh completed."; break ;;
+              Failed|Cancelled) echo "Instance refresh $STATUS"; exit 1 ;;
+            esac
+            [ "$i" -eq 60 ] && { echo "Timeout waiting for instance refresh"; exit 1; }
+            sleep 30
+          done
+
+  # ── Push: other app changes → SSM restart on running instance ─────────────
   deploy-app:
     needs: detect-changes
     if: >
       github.event_name == 'push' &&
       needs.detect-changes.outputs.app == 'true' &&
-      needs.detect-changes.outputs.infra != 'true'
+      needs.detect-changes.outputs.infra != 'true' &&
+      needs.detect-changes.outputs.env_file != 'true'
     runs-on: ubuntu-latest
     steps:
       - uses: aws-actions/configure-aws-credentials@v4
@@ -156,7 +196,7 @@ jobs:
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --parameters '{"commands":["cd /home/ubuntu/dbt-kg && git pull && docker compose pull && docker compose up -d"]}' \
+            --parameters '{"commands":["export PATH=$PATH:/usr/local/bin && cd /home/ubuntu/dbt-kg && git pull && docker-compose pull && docker-compose up -d"]}' \
             --query "Command.CommandId" --output text)
           echo "SSM command: $COMMAND_ID — waiting..."
           for i in $(seq 1 40); do
