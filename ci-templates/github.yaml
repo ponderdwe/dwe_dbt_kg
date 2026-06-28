@@ -99,32 +99,36 @@ jobs:
         env:
           PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
           PULUMI_CONFIG_PASSPHRASE: ""
-      - name: Start and wait for ASG instance refresh
+      - name: Restart docker-compose on running EC2 via SSM
         run: |
           ASG_NAME=$(cd pulumi && pulumi stack output asg_name --stack ${{ env.WORKSPACE }})
-          echo "Starting instance refresh for ASG: $ASG_NAME"
-          aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "$ASG_NAME" \
-            --strategy Rolling \
-            --preferences '{"MinHealthyPercentage":0,"InstanceWarmup":300}' 2>&1 || true
-          echo "Waiting for instance refresh..."
+          INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].Instances[0].InstanceId" --output text)
+          echo "Restarting docker-compose on $INSTANCE_ID via SSM..."
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters '{"commands":["cd /home/ubuntu/dbt-kg && git pull && docker compose pull && docker compose up -d"]}' \
+            --query "Command.CommandId" --output text)
+          echo "SSM command: $COMMAND_ID — waiting..."
           for i in $(seq 1 40); do
-            STATUS=$(aws autoscaling describe-instance-refreshes \
-              --auto-scaling-group-name "$ASG_NAME" \
-              --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "Pending")
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
             echo "  [$i/40] $STATUS"
             case "$STATUS" in
-              Successful) echo "Instance refresh completed."; break ;;
-              Failed|Cancelled) echo "Instance refresh $STATUS"; exit 1 ;;
+              Success) echo "Restart completed."; break ;;
+              Failed|Cancelled|TimedOut) echo "SSM command $STATUS"; exit 1 ;;
             esac
-            [ "$i" -eq 40 ] && { echo "Timeout waiting for instance refresh"; exit 1; }
-            sleep 30
+            [ "$i" -eq 40 ] && { echo "Timeout waiting for SSM command"; exit 1; }
+            sleep 15
           done
         env:
           PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
           PULUMI_CONFIG_PASSPHRASE: ""
 
-  # ── Push: redeploy app via ASG instance refresh ────────────────────────────
+  # ── Push: redeploy app via SSM docker-compose restart ─────────────────────
   deploy-app:
     needs: detect-changes
     if: >
@@ -138,28 +142,32 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: {@ AWS_REGION @}
-      - name: Start and wait for ASG instance refresh
+      - name: Restart docker-compose on running EC2 via SSM
         run: |
           ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
             --filters \
               "Name=tag:Environment,Values={@ WORKSPACE_NAME @}" \
               "Name=tag:ManagedBy,Values=Pulumi" \
             --query "AutoScalingGroups[0].AutoScalingGroupName" --output text)
-          echo "Starting instance refresh for ASG: $ASG_NAME"
-          aws autoscaling start-instance-refresh \
-            --auto-scaling-group-name "$ASG_NAME" \
-            --strategy Rolling \
-            --preferences '{"MinHealthyPercentage":0,"InstanceWarmup":300}' 2>&1 || true
-          echo "Waiting for instance refresh..."
+          INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
+            --auto-scaling-group-names "$ASG_NAME" \
+            --query "AutoScalingGroups[0].Instances[0].InstanceId" --output text)
+          echo "Restarting docker-compose on $INSTANCE_ID via SSM..."
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids "$INSTANCE_ID" \
+            --document-name "AWS-RunShellScript" \
+            --parameters '{"commands":["cd /home/ubuntu/dbt-kg && git pull && docker compose pull && docker compose up -d"]}' \
+            --query "Command.CommandId" --output text)
+          echo "SSM command: $COMMAND_ID — waiting..."
           for i in $(seq 1 40); do
-            STATUS=$(aws autoscaling describe-instance-refreshes \
-              --auto-scaling-group-name "$ASG_NAME" \
-              --query "InstanceRefreshes[0].Status" --output text 2>/dev/null || echo "Pending")
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
             echo "  [$i/40] $STATUS"
             case "$STATUS" in
-              Successful) echo "Instance refresh completed."; break ;;
-              Failed|Cancelled) echo "Instance refresh $STATUS"; exit 1 ;;
+              Success) echo "Restart completed."; break ;;
+              Failed|Cancelled|TimedOut) echo "SSM command $STATUS"; exit 1 ;;
             esac
-            [ "$i" -eq 40 ] && { echo "Timeout waiting for instance refresh"; exit 1; }
-            sleep 30
+            [ "$i" -eq 40 ] && { echo "Timeout waiting for SSM command"; exit 1; }
+            sleep 15
           done

@@ -21,7 +21,8 @@ services:
   falkordb:
     image: falkordb/falkordb:latest
     restart: always
-    command: --requirepass ${GRAPH_PASSWORD}
+    environment:
+      - REDIS_ARGS=--requirepass ${GRAPH_PASSWORD}
     ports:
       - "6379:6379"
       - "3000:3000"
