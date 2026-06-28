@@ -141,14 +141,18 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: {@ AWS_REGION @}
+      - name: Install Pulumi CLI
+        run: curl -fsSL https://get.pulumi.com | sh && echo "$HOME/.pulumi/bin" >> $GITHUB_PATH
+      - name: Get ASG name from Pulumi state
+        run: |
+          pulumi login $PULUMI_BACKEND_URL
+          cd pulumi && pulumi stack select ${{ env.WORKSPACE }} --non-interactive 2>/dev/null; cd ..
+          echo "ASG_NAME=$(cd pulumi && pulumi stack output asg_name --stack ${{ env.WORKSPACE }} --non-interactive)" >> $GITHUB_ENV
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
+          PULUMI_CONFIG_PASSPHRASE: ""
       - name: Full instance refresh (re-reads Secrets Manager on boot)
         run: |
-          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
-            --filters \
-              "Name=tag:Project,Values={@ PROJECT_NAME @}" \
-              "Name=tag:Environment,Values={@ WORKSPACE_NAME @}" \
-              "Name=tag:ManagedBy,Values=Pulumi" \
-            --query "AutoScalingGroups[0].AutoScalingGroupName" --output text)
           echo "Starting instance refresh for ASG: $ASG_NAME"
           aws autoscaling start-instance-refresh \
             --auto-scaling-group-name "$ASG_NAME" \
@@ -183,14 +187,18 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: {@ AWS_REGION @}
+      - name: Install Pulumi CLI
+        run: curl -fsSL https://get.pulumi.com | sh && echo "$HOME/.pulumi/bin" >> $GITHUB_PATH
+      - name: Get ASG name from Pulumi state
+        run: |
+          pulumi login $PULUMI_BACKEND_URL
+          cd pulumi && pulumi stack select ${{ env.WORKSPACE }} --non-interactive 2>/dev/null; cd ..
+          echo "ASG_NAME=$(cd pulumi && pulumi stack output asg_name --stack ${{ env.WORKSPACE }} --non-interactive)" >> $GITHUB_ENV
+        env:
+          PULUMI_BACKEND_URL: ${{ secrets.PULUMI_S3_STATE }}
+          PULUMI_CONFIG_PASSPHRASE: ""
       - name: Restart docker-compose on running EC2 via SSM
         run: |
-          ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
-            --filters \
-              "Name=tag:Project,Values={@ PROJECT_NAME @}" \
-              "Name=tag:Environment,Values={@ WORKSPACE_NAME @}" \
-              "Name=tag:ManagedBy,Values=Pulumi" \
-            --query "AutoScalingGroups[0].AutoScalingGroupName" --output text)
           INSTANCE_ID=$(aws autoscaling describe-auto-scaling-groups \
             --auto-scaling-group-names "$ASG_NAME" \
             --query "AutoScalingGroups[0].Instances[0].InstanceId" --output text)

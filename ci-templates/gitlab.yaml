@@ -101,14 +101,14 @@ deploy-app-{@ ENV_NAME @}:
     - apt-get update -qq && apt-get install -y -qq curl unzip git
     - curl -fsSL https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip -o /tmp/awscliv2.zip
     - unzip -q /tmp/awscliv2.zip -d /tmp && /tmp/aws/install
+    - curl -fsSL https://get.pulumi.com | sh
   script:
     - |
-      ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
-        --filters \
-          "Name=tag:Project,Values={@ PROJECT_NAME @}" \
-          "Name=tag:Environment,Values={@ WORKSPACE_NAME @}" \
-          "Name=tag:ManagedBy,Values=Pulumi" \
-        --query "AutoScalingGroups[0].AutoScalingGroupName" --output text)
+      export PATH="$HOME/.pulumi/bin:$PATH"
+      pulumi login $PULUMI_S3_STATE
+      cd pulumi && (pulumi stack select $WORKSPACE --non-interactive 2>/dev/null || true) && cd ..
+      ASG_NAME=$(cd pulumi && pulumi stack output asg_name --stack $WORKSPACE --non-interactive)
+      echo "ASG: $ASG_NAME"
       CHANGED=$(git diff --name-only HEAD~1 HEAD 2>/dev/null || echo "")
       if echo "$CHANGED" | grep -qF ".env.example"; then
         echo ".env.example changed — running full instance refresh to re-read Secrets Manager"
@@ -165,3 +165,5 @@ deploy-app-{@ ENV_NAME @}:
     AWS_ACCESS_KEY_ID: $AWS_ACCESS_KEY_ID
     AWS_SECRET_ACCESS_KEY: $AWS_SECRET_ACCESS_KEY
     AWS_DEFAULT_REGION: "{@ AWS_REGION @}"
+    PULUMI_CONFIG_PASSPHRASE: ""
+    WORKSPACE: "{@ WORKSPACE_NAME @}"
