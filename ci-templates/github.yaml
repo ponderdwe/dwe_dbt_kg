@@ -182,6 +182,8 @@ jobs:
           aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: {@ AWS_REGION @}
+      - name: Install boto3
+        run: pip install boto3 -q
       - name: Restart docker-compose on running EC2 via SSM
         run: |
           ASG_NAME=$(aws autoscaling describe-auto-scaling-groups \
@@ -193,29 +195,73 @@ jobs:
             --auto-scaling-group-names "$ASG_NAME" \
             --query "AutoScalingGroups[0].Instances[0].InstanceId" --output text)
           echo "Restarting docker-compose on $INSTANCE_ID via SSM..."
-          COMMAND_ID=$(aws ssm send-command \
-            --instance-ids "$INSTANCE_ID" \
-            --document-name "AWS-RunShellScript" \
-            --parameters '{"commands":["git config --global --add safe.directory /home/ubuntu/dbt-kg","git -C /home/ubuntu/dbt-kg pull","/usr/local/bin/docker-compose -f /home/ubuntu/dbt-kg/docker-compose.yml pull || true","/usr/local/bin/docker-compose -f /home/ubuntu/dbt-kg/docker-compose.yml up -d"]}' \
-            --query "Command.CommandId" --output text)
-          echo "SSM command: $COMMAND_ID — waiting..."
-          for i in $(seq 1 40); do
-            STATUS=$(aws ssm get-command-invocation \
-              --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-              --query "Status" --output text 2>/dev/null || echo "Pending")
-            echo "  [$i/40] $STATUS"
-            case "$STATUS" in
-              Success) echo "Restart completed."; break ;;
-              Failed|Cancelled|TimedOut)
-                echo "SSM command $STATUS — stdout/stderr:"
-                aws ssm get-command-invocation \
-                  --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-                  --query "StandardOutputContent" --output text 2>/dev/null || true
-                aws ssm get-command-invocation \
-                  --command-id "$COMMAND_ID" --instance-id "$INSTANCE_ID" \
-                  --query "StandardErrorContent" --output text 2>/dev/null || true
-                exit 1 ;;
-            esac
-            [ "$i" -eq 40 ] && { echo "Timeout waiting for SSM command"; exit 1; }
-            sleep 15
-          done
+          python3 - "$INSTANCE_ID" <<'PYEOF'
+          import sys, time, boto3
+
+          instance_id = sys.argv[1]
+          ssm = boto3.client('ssm', region_name='{@ AWS_REGION @}')
+
+          # Self-contained bootstrap: sets HOME, clones repo if missing, refreshes .env, restarts
+          script = """\
+          #!/bin/bash
+          set -e
+          export HOME=/root
+          REGION={@ AWS_REGION @}
+          SECRET_ID={@ SECRET_NAME @}
+          BRANCH={@ ENV_NAME @}
+          REPO_DIR=/home/ubuntu/dbt-kg
+          REPO_URL={@ GIT_REPO_URL @}
+
+          SECRET_JSON=$(aws secretsmanager get-secret-value \
+            --secret-id "$SECRET_ID" --region "$REGION" \
+            --query SecretString --output text)
+          GIT_USER=$(echo "$SECRET_JSON" | jq -r '.git_deploy_username // "x-token-auth"')
+          GIT_TOKEN=$(echo "$SECRET_JSON" | jq -r '.git_deploy_token')
+
+          if [ ! -d "$REPO_DIR" ]; then
+            echo "Repo not found at $REPO_DIR — cloning..."
+            REPO_PATH=$(echo "$REPO_URL" | sed 's,https://,,')
+            git clone "https://$GIT_USER:$GIT_TOKEN@$REPO_PATH" "$REPO_DIR"
+            git -C "$REPO_DIR" checkout "$BRANCH"
+          else
+            git config --global --add safe.directory "$REPO_DIR"
+            git -C "$REPO_DIR" pull
+          fi
+
+          echo "$SECRET_JSON" | jq -r 'to_entries[] | .key + "=" + (.value | tostring)' > "$REPO_DIR/.env"
+          echo "GRAPH_DB=falkordb" >> "$REPO_DIR/.env"
+          echo "GRAPH_HOST=falkordb" >> "$REPO_DIR/.env"
+          echo "GRAPH_PORT=6379" >> "$REPO_DIR/.env"
+
+          /usr/local/bin/docker-compose -f "$REPO_DIR/docker-compose.yml" pull || true
+          /usr/local/bin/docker-compose -f "$REPO_DIR/docker-compose.yml" up -d
+          """
+
+          resp = ssm.send_command(
+              InstanceIds=[instance_id],
+              DocumentName='AWS-RunShellScript',
+              Parameters={'commands': [script]},
+          )
+          command_id = resp['Command']['CommandId']
+          print(f'SSM command: {command_id} — waiting...')
+
+          for i in range(1, 41):
+              time.sleep(15)
+              try:
+                  inv = ssm.get_command_invocation(CommandId=command_id, InstanceId=instance_id)
+                  status = inv['Status']
+              except Exception:
+                  status = 'Pending'
+              print(f'  [{i}/40] {status}')
+              if status == 'Success':
+                  print('Restart completed.')
+                  sys.exit(0)
+              elif status in ('Failed', 'Cancelled', 'TimedOut'):
+                  print(f'SSM command {status}')
+                  print(inv.get('StandardOutputContent', ''))
+                  print(inv.get('StandardErrorContent', ''))
+                  sys.exit(1)
+
+          print('Timeout waiting for SSM command')
+          sys.exit(1)
+          PYEOF
