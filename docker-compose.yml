@@ -20,6 +20,10 @@ services:
   falkordb:
     image: falkordb/falkordb:latest
     restart: always
+    command: --requirepass ${GRAPH_PASSWORD}
+    ports:
+      - "6379:6379"
+      - "3000:3000"
     volumes:
       - falkordb_data:/var/lib/falkordb/data
     networks:
@@ -34,6 +38,7 @@ services:
       - GRAPH_DB=falkordb
       - GRAPH_HOST=falkordb
       - GRAPH_PORT=6379
+      - GRAPH_PASSWORD=${GRAPH_PASSWORD}
     depends_on:
       - falkordb
     networks:
