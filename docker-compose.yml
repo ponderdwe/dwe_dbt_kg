@@ -12,7 +12,6 @@ networks:
     driver: bridge
 
 volumes:
-  falkordb_data:
   postgres_data:
 
 services:
@@ -27,7 +26,7 @@ services:
       - "6379:6379"
       - "3000:3000"
     volumes:
-      - falkordb_data:/var/lib/falkordb/data
+      - /mnt/falkordb-data:/var/lib/falkordb/data
     networks:
       - dbt_kg_network
 
