@@ -181,7 +181,7 @@ if falkordb_persist:
     efs_sg = aws.ec2.SecurityGroup(
         f"{project_name}-efs-sg{suffix}",
         name=f"{project_name}-efs-sg{suffix}",
-        description="dbt-kg EFS — NFS from EC2",
+        description="dbt-kg EFS - NFS from EC2",
         vpc_id=vpc_id,
         tags={**tags, "Name": f"{project_name}-efs-sg{suffix}"},
     )
