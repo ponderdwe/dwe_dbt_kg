@@ -173,91 +173,50 @@ else:
     _r53_block = ""
 
 # ─────────────────────────────────────────────────────────────────────────────
-# EBS — FalkorDB persistent volume (optional, EBS_FALKORDB_STORAGE_PERSIST=true)
+# EFS — FalkorDB persistent filesystem (optional, EBS_FALKORDB_STORAGE_PERSIST=true)
 # ─────────────────────────────────────────────────────────────────────────────
 falkordb_persist = secrets.get("EBS_FALKORDB_STORAGE_PERSIST", "false").lower() == "true"
 
 if falkordb_persist:
-    # EBS is AZ-scoped — pin the ASG to the first subnet so instance and volume
-    # always land in the same AZ.
-    first_subnet = aws.ec2.get_subnet(id=alb_subnet_ids[0])
-    asg_subnets = [alb_subnet_ids[0]]
+    efs_sg = aws.ec2.SecurityGroup(
+        f"{project_name}-efs-sg{suffix}",
+        name=f"{project_name}-efs-sg{suffix}",
+        description="dbt-kg EFS — NFS from EC2",
+        vpc_id=vpc_id,
+        tags={**tags, "Name": f"{project_name}-efs-sg{suffix}"},
+    )
+    aws.ec2.SecurityGroupRule(f"{project_name}-efs-nfs{suffix}",
+        type="ingress", security_group_id=efs_sg.id,
+        protocol="tcp", from_port=2049, to_port=2049,
+        source_security_group_id=ec2_sg.id)
+    aws.ec2.SecurityGroupRule(f"{project_name}-efs-egress{suffix}",
+        type="egress", security_group_id=efs_sg.id,
+        protocol="-1", from_port=0, to_port=0, cidr_blocks=["0.0.0.0/0"])
 
-    falkordb_ebs = aws.ebs.Volume(
+    falkordb_efs = aws.efs.FileSystem(
         f"{project_name}-falkordb{suffix}",
-        availability_zone=first_subnet.availability_zone,
-        size=int(secrets.get("EBS_FALKORDB_VOLUME_SIZE_GB", "50")),
-        type="gp3",
         encrypted=True,
         tags={**tags, "Name": f"{project_name}-falkordb{suffix}"},
     )
-    aws.iam.RolePolicy(
-        f"{project_name}-ebs{suffix}",
-        role=instance_role.name,
-        policy=json.dumps({
-            "Version": "2012-10-17",
-            "Statement": [{"Effect": "Allow",
-                           "Action": ["ec2:AttachVolume", "ec2:DescribeVolumes"],
-                           "Resource": "*"}],
-        }),
-    )
+    for i, subnet_id in enumerate(alb_subnet_ids):
+        aws.efs.MountTarget(
+            f"{project_name}-efs-mt{suffix}-{i}",
+            file_system_id=falkordb_efs.id,
+            subnet_id=subnet_id,
+            security_groups=[efs_sg.id],
+        )
 
-    def _ebs_attach_block(vol_id: str) -> str:
-        return f"""
-# ── EBS: attach FalkorDB persistent volume ───────────────────────────
-INSTANCE_ID=$(curl -s http://169.254.169.254/latest/meta-data/instance-id)
-EBS_VOLUME_ID="{vol_id}"
-echo "Waiting for EBS volume $EBS_VOLUME_ID..."
-for i in $(seq 1 30); do
-  STATUS=$(aws ec2 describe-volumes --volume-ids $EBS_VOLUME_ID --region {aws_region} --query 'Volumes[0].State' --output text 2>/dev/null || echo "unknown")
-  echo "  [$i/30] $STATUS"
-  [ "$STATUS" = "available" ] && break
-  sleep 10
-done
-aws ec2 attach-volume --volume-id $EBS_VOLUME_ID --instance-id $INSTANCE_ID --device /dev/xvdf --region {aws_region}
-echo "Waiting for AWS attachment state..."
-for i in $(seq 1 30); do
-  STATUS=$(aws ec2 describe-volumes --volume-ids $EBS_VOLUME_ID --region {aws_region} --query 'Volumes[0].Attachments[0].State' --output text 2>/dev/null || echo "unknown")
-  echo "  [$i/30] $STATUS"
-  [ "$STATUS" = "attached" ] && break
-  sleep 5
-done
-# AWS says attached but kernel may not have created the device node yet.
-# On Nitro instances /dev/xvdf is exposed as an NVMe device; find it via by-id symlink.
-echo "Waiting for block device to appear..."
-DEVICE=""
-VOL_SHORT=$(echo "$EBS_VOLUME_ID" | sed 's/vol-//')
-for i in $(seq 1 60); do
-  if [ -b /dev/xvdf ]; then
-    DEVICE=/dev/xvdf
-    break
-  fi
-  NVME_LINK=$(ls /dev/disk/by-id/nvme-Amazon_Elastic_Block_Store_vol${{VOL_SHORT}}* 2>/dev/null | head -1)
-  if [ -n "$NVME_LINK" ]; then
-    DEVICE=$(readlink -f "$NVME_LINK")
-    break
-  fi
-  echo "  [$i/60] waiting for device node..."
-  sleep 2
-done
-if [ -z "$DEVICE" ]; then
-  echo "ERROR: block device did not appear after EBS attach"; exit 1
-fi
-echo "Block device: $DEVICE"
-if ! blkid "$DEVICE" > /dev/null 2>&1; then
-  echo "New volume — formatting as ext4..."
-  mkfs -t ext4 "$DEVICE"
-fi
-mount "$DEVICE" /mnt/falkordb-data
-echo "$DEVICE /mnt/falkordb-data ext4 defaults,nofail 0 2" >> /etc/fstab
-echo "FalkorDB EBS volume mounted at /mnt/falkordb-data"
-"""
-
-    _ebs_script = falkordb_ebs.id.apply(_ebs_attach_block)
-    pulumi.export("falkordb_ebs_volume_id", falkordb_ebs.id)
+    _storage_script = falkordb_efs.dns_name.apply(lambda dns: f"""
+# ── EFS: mount FalkorDB persistent filesystem ────────────────────────
+apt-get install -y nfs-common
+echo "Mounting EFS {dns}..."
+mount -t nfs4 -o nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2 {dns}:/ /mnt/falkordb-data
+echo "{dns}:/ /mnt/falkordb-data nfs4 nfsvers=4.1,rsize=1048576,wsize=1048576,hard,timeo=600,retrans=2,_netdev 0 0" >> /etc/fstab
+echo "FalkorDB EFS mounted at /mnt/falkordb-data"
+""")
+    pulumi.export("falkordb_efs_id", falkordb_efs.id)
 else:
-    _ebs_script = pulumi.Output.from_input("")
-    asg_subnets = alb_subnet_ids
+    _storage_script = pulumi.Output.from_input("")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # User data — install Docker, clone repo, write .env from Secrets Manager
@@ -311,7 +270,7 @@ cd /home/ubuntu/dbt-kg && docker-compose up -d
 {_r53_block}"""
     return base64.b64encode(script.encode()).decode()
 
-user_data = _ebs_script.apply(_build_user_data)
+user_data = _storage_script.apply(_build_user_data)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Launch Template
@@ -402,7 +361,7 @@ asg = aws.autoscaling.Group(
     f"{project_name}-asg{suffix}",
     name=f"{project_name}-asg{suffix}",
     min_size=1, max_size=2, desired_capacity=1,
-    vpc_zone_identifiers=asg_subnets,
+    vpc_zone_identifiers=alb_subnet_ids,
     target_group_arns=[tg.arn],
     launch_template=aws.autoscaling.GroupLaunchTemplateArgs(id=lt.id, version="$Latest"),
     health_check_type="ELB",
